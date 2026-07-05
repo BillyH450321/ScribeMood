@@ -1,0 +1,44 @@
+{
+  "user": {
+    "id": 1,
+    "name": "Jane Doe",
+    "email": "usmc450321@gmail.com",
+    "avatar_url": "https://images.unsplash.com/photo-1494790108377-be9c29b29330",
+    "bio": "A passionate sci-fi and fantasy writer capturing lost realms and futuristic worlds.",
+    "membership": "Pro Tier",
+    "stats": {
+      "total_stories": 12,
+      "total_words": 42500,
+      "streak_days": 5
+    }
+  },
+  "projects": [
+    {
+      "id": 101,
+      "title": "Neon Horizon",
+      "genre": "Sci-Fi Cyberpunk",
+      "word_count": 5200,
+      "status": "In Progress",
+      "last_updated": "2026-07-04T15:00:00Z",
+      "summary": "A lost detective navigating the neon-soaked alleys of Neo-Tokyo in search of a rogue AI entity."
+    },
+    {
+      "id": 102,
+      "title": "The Whispering Spire",
+      "genre": "Dark Gothic Fantasy",
+      "word_count": 8400,
+      "status": "Draft",
+      "last_updated": "2026-07-03T18:30:00Z",
+      "summary": "An ancient tower hidden within the mist-bound mountains whispers forgotten secrets to those who dare enter."
+    },
+    {
+      "id": 103,
+      "title": "Stardust and Sand",
+      "genre": "Cosmic Horror",
+      "word_count": 12000,
+      "status": "Completed",
+      "last_updated": "2026-06-28T10:15:00Z",
+      "summary": "An exploratory team on a desert planet uncovers ancient ruins that defy the laws of space and time."
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Scribe Mood",
+  "description": "An interactive creative writing interface where AI analyzes your uploaded images, ghostwrites custom story openings, narrates them with an expressive voice, and helps you continue the journey.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
