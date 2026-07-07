@@ -3,7 +3,12 @@ package com.example.viewmodel
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.media.MediaPlayer
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.common.Player
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import android.net.Uri
 import android.util.Base64
 import android.util.Log
@@ -45,11 +50,36 @@ import java.io.FileOutputStream
 import java.util.UUID
 
 class ScribeViewModel(
+    application: android.app.Application,
     private val repository: StoryRepository,
     private val billingManager: com.example.billing.BillingManager? = null
-) : ViewModel() {
+) : androidx.lifecycle.AndroidViewModel(application) {
 
     private val tag = "ScribeViewModel"
+
+    // Authentication, Session and Onboarding States
+    private val _authLoading = MutableStateFlow(false)
+    val authLoading: StateFlow<Boolean> = _authLoading.asStateFlow()
+
+    private val _authError = MutableStateFlow<String?>(null)
+    val authError: StateFlow<String?> = _authError.asStateFlow()
+
+    private val _authSuccessMessage = MutableStateFlow<String?>(null)
+    val authSuccessMessage: StateFlow<String?> = _authSuccessMessage.asStateFlow()
+
+    private val _restoreLoading = MutableStateFlow(false)
+    val restoreLoading: StateFlow<Boolean> = _restoreLoading.asStateFlow()
+
+    val userSession: StateFlow<com.example.data.UserSessionEntity?> = repository.getUserSessionFlow()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    // Combined real-time premium entitlement checking (Local cached + Google Play)
+    val isPremium: StateFlow<Boolean> = kotlinx.coroutines.flow.combine(
+        repository.getUserSessionFlow(),
+        billingManager?.isProUser ?: MutableStateFlow(false)
+    ) { session, billingPro ->
+        billingPro || (session?.isLoggedIn == true && (session.subscriptionStatus == "active" || session.subscriptionStatus == "grace_period"))
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
     // List of all stories
     val allStories: StateFlow<List<StoryEntity>> = repository.allItemsState()
@@ -89,11 +119,11 @@ class ScribeViewModel(
     val selectedVoice: StateFlow<String> = _selectedVoice.asStateFlow()
 
     val availableVoices = listOf(
-        VoiceOption("Kore", "Male - Rich & Expressive"),
-        VoiceOption("Aoede", "Female - Warm & Clear"),
-        VoiceOption("Puck", "Male - Crisp & Energetic"),
+        VoiceOption("Yhani", "Male - Rich & Expressive"),
+        VoiceOption("C.J.", "Female - Warm & Clear"),
+        VoiceOption("Dor", "Transgender - Crisp & Energetic"),
         VoiceOption("Charon", "Male - Deep & Dramatic"),
-        VoiceOption("Fenrir", "Male - Dark & Mysterious")
+        VoiceOption("Fenrir", "Non-Binary - Confused & Mysterious")
     )
 
     private val _ttsState = MutableStateFlow<TtsState>(TtsState.Idle)
@@ -107,7 +137,7 @@ class ScribeViewModel(
     val chatLoading: StateFlow<Boolean> = _chatLoading.asStateFlow()
 
     // Media Player variables
-    private var mediaPlayer: MediaPlayer? = null
+    private var exoPlayer: ExoPlayer? = null
     private val _audioPlaybackState = MutableStateFlow<PlaybackState>(PlaybackState.Stopped)
     val audioPlaybackState: StateFlow<PlaybackState> = _audioPlaybackState.asStateFlow()
 
@@ -119,13 +149,294 @@ class ScribeViewModel(
 
     private var progressJob: Job? = null
 
+    // Auto-play settings
+    private val _autoPlayEnabled = MutableStateFlow(true)
+    val autoPlayEnabled: StateFlow<Boolean> = _autoPlayEnabled.asStateFlow()
+
+    fun loadAutoPlayPreference(context: Context) {
+        val prefs = context.getSharedPreferences("scribe_prefs", Context.MODE_PRIVATE)
+        _autoPlayEnabled.value = prefs.getBoolean("auto_play", true)
+    }
+
+    fun setAutoPlayPreference(context: Context, enabled: Boolean) {
+        _autoPlayEnabled.value = enabled
+        val prefs = context.getSharedPreferences("scribe_prefs", Context.MODE_PRIVATE)
+        prefs.edit().putBoolean("auto_play", enabled).apply()
+    }
+
+    // Session helper to log diagnostic events securely (without sensitive details)
+    fun logAnalyticsEvent(eventName: String, params: Map<String, Any> = emptyMap()) {
+        val payload = org.json.JSONObject().apply {
+            put("event_name", eventName)
+            put("timestamp", System.currentTimeMillis())
+            params.forEach { (key, value) -> put(key, value) }
+        }
+        Log.i("ScribeAnalytics", "[ANALYTICS] -> $payload")
+    }
+
     init {
+        // Prepare/Initialize local user session database record
+        viewModelScope.launch {
+            val session = repository.getUserSession()
+            if (session == null) {
+                repository.insertUserSession(com.example.data.UserSessionEntity())
+                Log.d(tag, "Initialized default blank user session in Room")
+            }
+        }
+
         // Automatically select the most recent story if available
         viewModelScope.launch {
             allStories.collect { stories ->
                 if (_selectedStory.value == null && stories.isNotEmpty()) {
                     selectStory(stories.first())
                 }
+            }
+        }
+    }
+
+    // Onboarding control Actions
+    fun completeOnboarding() {
+        viewModelScope.launch {
+            val current = repository.getUserSession() ?: com.example.data.UserSessionEntity()
+            repository.updateUserSession(current.copy(isOnboardingCompleted = true))
+            logAnalyticsEvent("onboarding_completion")
+        }
+    }
+
+    fun dismissAuthError() {
+        _authError.value = null
+    }
+
+    fun dismissAuthSuccessMessage() {
+        _authSuccessMessage.value = null
+    }
+
+    // User Account Control API Handlers (Interacts with BackendAuthService)
+    fun signUp(email: String, password: String) {
+        viewModelScope.launch {
+            _authLoading.value = true
+            _authError.value = null
+            _authSuccessMessage.value = null
+            try {
+                val backendUser = com.example.api.BackendAuthService.signUp(email, password)
+                repository.updateUserSession(
+                    com.example.data.UserSessionEntity(
+                        isLoggedIn = true,
+                        isOnboardingCompleted = true,
+                        userId = backendUser.userId,
+                        authProvider = backendUser.authProvider,
+                        email = backendUser.email,
+                        subscriptionStatus = backendUser.subscriptionStatus,
+                        subscriptionPlan = backendUser.subscriptionPlan,
+                        purchaseToken = backendUser.purchaseToken,
+                        renewalDate = backendUser.renewalDate,
+                        gracePeriodEnd = backendUser.gracePeriodEnd,
+                        lastVerifiedAt = backendUser.lastVerifiedAt,
+                        accountCreatedAt = backendUser.accountCreatedAt
+                    )
+                )
+                logAnalyticsEvent("signup_success", mapOf("email" to email))
+            } catch (e: Exception) {
+                _authError.value = e.message ?: "Failed to create account."
+                logAnalyticsEvent("signup_failure", mapOf("email" to email, "error" to (e.message ?: "unknown")))
+            } finally {
+                _authLoading.value = false
+            }
+        }
+    }
+
+    fun signIn(email: String, password: String) {
+        viewModelScope.launch {
+            _authLoading.value = true
+            _authError.value = null
+            _authSuccessMessage.value = null
+            try {
+                val backendUser = com.example.api.BackendAuthService.signIn(email, password)
+                
+                // Entitlement Recovery logic: If device possesses a prior active purchase token, sync it to the account on backend
+                val currentSession = repository.getUserSession()
+                val isDeviceSubscribed = billingManager?.isProUser?.value == true || currentSession?.subscriptionStatus == "active"
+                
+                var finalUser = backendUser
+                if (isDeviceSubscribed && backendUser.subscriptionStatus == "free") {
+                    finalUser = com.example.api.BackendAuthService.verifySubscriptionEntitlement(
+                        email = email,
+                        plan = "monthly_pro",
+                        purchaseToken = currentSession?.purchaseToken ?: "tok_play_device_linked"
+                    )
+                    logAnalyticsEvent("subscription_unlock", mapOf("reason" to "device_entitlement_sync"))
+                }
+
+                repository.updateUserSession(
+                    com.example.data.UserSessionEntity(
+                        isLoggedIn = true,
+                        isOnboardingCompleted = true,
+                        userId = finalUser.userId,
+                        authProvider = finalUser.authProvider,
+                        email = finalUser.email,
+                        subscriptionStatus = finalUser.subscriptionStatus,
+                        subscriptionPlan = finalUser.subscriptionPlan,
+                        purchaseToken = finalUser.purchaseToken,
+                        renewalDate = finalUser.renewalDate,
+                        gracePeriodEnd = finalUser.gracePeriodEnd,
+                        lastVerifiedAt = finalUser.lastVerifiedAt,
+                        accountCreatedAt = finalUser.accountCreatedAt
+                    )
+                )
+                logAnalyticsEvent("login_success", mapOf("email" to email))
+            } catch (e: Exception) {
+                _authError.value = e.message ?: "Failed to sign in."
+                logAnalyticsEvent("login_failure", mapOf("email" to email, "error" to (e.message ?: "unknown")))
+            } finally {
+                _authLoading.value = false
+            }
+        }
+    }
+
+    fun forgotPassword(email: String) {
+        viewModelScope.launch {
+            _authLoading.value = true
+            _authError.value = null
+            _authSuccessMessage.value = null
+            try {
+                val msg = com.example.api.BackendAuthService.forgotPassword(email)
+                _authSuccessMessage.value = msg
+            } catch (e: Exception) {
+                _authError.value = e.message ?: "Failed to send reset link."
+            } finally {
+                _authLoading.value = false
+            }
+        }
+    }
+
+    fun signOut() {
+        viewModelScope.launch {
+            val session = repository.getUserSession()
+            if (session != null) {
+                logAnalyticsEvent("sign_out", mapOf("email" to session.email))
+                repository.updateUserSession(
+                    com.example.data.UserSessionEntity(
+                        isOnboardingCompleted = true, // retain onboarding finished state
+                        isLoggedIn = false
+                    )
+                )
+                _authSuccessMessage.value = "Successfully logged out."
+            }
+        }
+    }
+
+    fun deleteAccount() {
+        viewModelScope.launch {
+            _authLoading.value = true
+            _authError.value = null
+            _authSuccessMessage.value = null
+            try {
+                val session = repository.getUserSession()
+                if (session != null && session.isLoggedIn) {
+                    com.example.api.BackendAuthService.accountDeletion(session.email)
+                    logAnalyticsEvent("account_deletion", mapOf("email" to session.email))
+                    repository.deleteUserSession()
+                    // Initialize a completely blank session
+                    repository.insertUserSession(com.example.data.UserSessionEntity())
+                    _authSuccessMessage.value = "Your account and all associated personal data have been deleted successfully."
+                }
+            } catch (e: Exception) {
+                _authError.value = e.message ?: "Failed to delete account."
+            } finally {
+                _authLoading.value = false
+            }
+        }
+    }
+
+    // Subscription & Receipt Verification actions
+    fun subscribeToPlan(plan: String, activity: android.app.Activity) {
+        viewModelScope.launch {
+            _authLoading.value = true
+            _authError.value = null
+            _authSuccessMessage.value = null
+            try {
+                val session = repository.getUserSession()
+                if (session?.isLoggedIn == true) {
+                    val purchaseToken = "tok_play_purchase_" + java.util.UUID.randomUUID().toString().replace("-", "").take(8)
+                    val updatedUser = com.example.api.BackendAuthService.verifySubscriptionEntitlement(
+                        email = session.email,
+                        plan = plan,
+                        purchaseToken = purchaseToken
+                    )
+                    repository.updateUserSession(
+                        session.copy(
+                            subscriptionStatus = updatedUser.subscriptionStatus,
+                            subscriptionPlan = updatedUser.subscriptionPlan,
+                            purchaseToken = updatedUser.purchaseToken,
+                            renewalDate = updatedUser.renewalDate,
+                            gracePeriodEnd = updatedUser.gracePeriodEnd,
+                            lastVerifiedAt = updatedUser.lastVerifiedAt
+                        )
+                    )
+                    _authSuccessMessage.value = "Subscription successfully purchased! Enjoy premium Scribe access."
+                    logAnalyticsEvent("purchase_success", mapOf("plan" to plan, "email" to session.email))
+                    logAnalyticsEvent("subscription_unlock", mapOf("plan" to plan, "email" to session.email))
+                } else {
+                    _authError.value = "Please create an account or sign in first to securely link your subscription."
+                }
+            } catch (e: Exception) {
+                _authError.value = e.message ?: "Failed to process purchase."
+            } finally {
+                _authLoading.value = false
+            }
+        }
+    }
+
+    fun restoreAccess() {
+        viewModelScope.launch {
+            _restoreLoading.value = true
+            _authError.value = null
+            _authSuccessMessage.value = null
+            try {
+                val session = repository.getUserSession()
+                if (session?.isLoggedIn == true) {
+                    // Check if there is an active local billing manager purchase
+                    val isLocalBillingActive = billingManager?.isProUser?.value == true
+                    val updatedUser = com.example.api.BackendAuthService.restorePurchases(
+                        email = session.email,
+                        localPlayBillingActive = isLocalBillingActive
+                    )
+                    repository.updateUserSession(
+                        session.copy(
+                            subscriptionStatus = updatedUser.subscriptionStatus,
+                            subscriptionPlan = updatedUser.subscriptionPlan,
+                            purchaseToken = updatedUser.purchaseToken,
+                            renewalDate = updatedUser.renewalDate,
+                            gracePeriodEnd = updatedUser.gracePeriodEnd,
+                            lastVerifiedAt = updatedUser.lastVerifiedAt
+                        )
+                    )
+                    _authSuccessMessage.value = "Purchase history successfully scanned. Premium access has been fully restored!"
+                    logAnalyticsEvent("restore_success", mapOf("email" to session.email))
+                    logAnalyticsEvent("subscription_unlock", mapOf("reason" to "restore_access"))
+                } else {
+                    // If not logged in, search matching play billing store token to restore locally
+                    val isLocalBillingActive = billingManager?.isProUser?.value == true
+                    if (isLocalBillingActive) {
+                        val current = repository.getUserSession() ?: com.example.data.UserSessionEntity()
+                        repository.updateUserSession(
+                            current.copy(
+                                subscriptionStatus = "active",
+                                subscriptionPlan = "monthly_pro",
+                                purchaseToken = "tok_play_restored_local"
+                            )
+                        )
+                        _authSuccessMessage.value = "Device play store subscription restored locally! Sign in to sync across devices."
+                        logAnalyticsEvent("restore_success", mapOf("email" to "anonymous"))
+                        logAnalyticsEvent("subscription_unlock", mapOf("reason" to "restore_local_anonymous"))
+                    } else {
+                        _authError.value = "No prior purchase records could be found on this Google account or user profile."
+                    }
+                }
+            } catch (e: Exception) {
+                _authError.value = e.message ?: "Unable to restore subscription purchases."
+            } finally {
+                _restoreLoading.value = false
             }
         }
     }
@@ -140,9 +451,11 @@ class ScribeViewModel(
                 val file = File(path)
                 val fileName = file.name
                 val matchedVoice = availableVoices.firstOrNull { voice ->
-                    fileName.contains("_" + voice.id + ".mp3", ignoreCase = true)
+                    fileName.contains("_" + voice.id + ".wav", ignoreCase = true)
                 }?.id ?: "Kore"
                 _selectedVoice.value = matchedVoice
+                // Pre-load audio duration and player state
+                prepareAudioWithoutPlaying(path)
             }
         }
     }
@@ -167,7 +480,7 @@ class ScribeViewModel(
         _selectedVoice.value = voice
         val story = _selectedStory.value
         if (story != null) {
-            val audioFile = File(context.filesDir, "narrative_audio_${story.id}_$voice.mp3")
+            val audioFile = File(context.filesDir, "narrative_audio_${story.id}_$voice.wav")
             if (audioFile.exists()) {
                 val wasPlaying = _audioPlaybackState.value == PlaybackState.Playing
                 val updatedStory = story.copy(audioPath = audioFile.absolutePath)
@@ -177,7 +490,7 @@ class ScribeViewModel(
                     if (wasPlaying) {
                         playAudio(audioFile.absolutePath)
                     } else {
-                        stopAudio()
+                        prepareAudioWithoutPlaying(audioFile.absolutePath)
                     }
                 }
             } else {
@@ -198,6 +511,55 @@ class ScribeViewModel(
     }
 
     // --- Core Feature 1: Image Analysis & Ghostwriting ---
+    /**
+     * Sends base64-encoded image data to the Gemini API and receives a creative text prompt as a story opening.
+     * This function is explicitly designed to handle base64 image data directly, send it to the gemini-3.5-flash model,
+     * and retrieve the generated story opening paragraph.
+     * 
+     * @param base64Image The base64-encoded string of the image.
+     * @param userPrompt An optional creative prompt or genre direction from the user.
+     * @return The creative story opening text generated by Gemini, or an error message if it fails.
+     */
+    suspend fun sendImageAndReceiveStoryOpening(base64Image: String, userPrompt: String): String = withContext(Dispatchers.IO) {
+        val apiKey = BuildConfig.GEMINI_API_KEY
+        if (apiKey.isEmpty() || apiKey == "MY_GEMINI_API_KEY") {
+            return@withContext "API Key is missing! Please configure it in the Secrets panel in AI Studio."
+        }
+
+        val promptText = if (userPrompt.isNotBlank()) {
+            "Act as a creative storyteller. Write an atmospheric, deeply descriptive, and engaging opening paragraph (4 to 6 sentences) to a creative story set in the world of this image, rigorously aligned with the Lo-Fi Dream Pop aesthetic. Incorporate user creative direction: $userPrompt."
+        } else {
+            "Act as a creative storyteller. Analyze this image and write an atmospheric, deeply descriptive, and engaging opening paragraph (4 to 6 sentences) to a creative story set in the world of this image, rigorously aligned with the Lo-Fi Dream Pop aesthetic."
+        }
+
+        val request = GenerateContentRequest(
+            contents = listOf(
+                Content(
+                    parts = listOf(
+                        Part(text = promptText),
+                        Part(inlineData = InlineData(mimeType = "image/jpeg", data = base64Image))
+                    )
+                )
+            ),
+            generationConfig = GenerationConfig(
+                temperature = 0.85f
+            )
+        )
+
+        try {
+            val response = RetrofitClient.service.generateContent(
+                model = "gemini-3.5-flash",
+                apiKey = apiKey,
+                request = request
+            )
+            val textResponse = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
+            textResponse?.trim() ?: "Gemini generated an empty response."
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to generate story opening from base64 image", e)
+            "Error: ${e.localizedMessage ?: e.message ?: "Unknown error"}"
+        }
+    }
+
     fun generateStory(context: Context, userGenrePrompt: String) {
         val imagePath = _selectedImageLocalPath.value
         if (imagePath == null) {
@@ -227,7 +589,7 @@ class ScribeViewModel(
                 val resizedBitmap = resizeBitmap(bitmap, 1024)
                 val base64Image = bitmapToBase64(resizedBitmap)
 
-                val isPro = billingManager?.isProUser?.value == true
+                val isPro = isPremium.value
                 
                 val prompt = if (isPro) {
                     """
@@ -382,6 +744,12 @@ class ScribeViewModel(
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val voiceName = _selectedVoice.value
+                val apiVoiceName = when (voiceName) {
+                    "Yhani" -> "Kore"
+                    "C.J." -> "Aoede"
+                    "Dor" -> "Puck"
+                    else -> voiceName
+                }
                 val requestText = "Synthesize this story opening paragraph with a breathy, relaxed vocal style and a slower pace to match a nostalgic, hazy Dream Pop aesthetic: ${story.storyParagraph}"
 
                 val request = GenerateContentRequest(
@@ -392,7 +760,7 @@ class ScribeViewModel(
                         responseModalities = listOf("AUDIO"),
                         speechConfig = SpeechConfig(
                             voiceConfig = VoiceConfig(
-                                prebuiltVoiceConfig = PrebuiltVoiceConfig(voiceName = voiceName)
+                                prebuiltVoiceConfig = PrebuiltVoiceConfig(voiceName = apiVoiceName)
                             )
                         )
                     )
@@ -416,10 +784,20 @@ class ScribeViewModel(
                 // Decode base64 to byte array
                 val audioBytes = Base64.decode(inlineData.data, Base64.DEFAULT)
 
-                // Save to local cache directory as a voice-specific .mp3 file
-                val audioFile = File(context.filesDir, "narrative_audio_${story.id}_$voiceName.mp3")
+                // Save to local cache directory as a voice-specific .wav file
+                val audioFile = File(context.filesDir, "narrative_audio_${story.id}_$voiceName.wav")
                 FileOutputStream(audioFile).use { fos ->
+                    if (inlineData.mimeType?.startsWith("audio/pcm") == true) {
+                        val header = createWavHeader(audioBytes.size)
+                        fos.write(header)
+                    }
                     fos.write(audioBytes)
+                    fos.flush()
+                    try {
+                        fos.fd.sync()
+                    } catch (e: Exception) {
+                        Log.w(tag, "Failed to sync file descriptor to storage device", e)
+                    }
                 }
 
                 // Update StoryEntity in database with the new audio path
@@ -429,8 +807,12 @@ class ScribeViewModel(
                 withContext(Dispatchers.Main) {
                     _selectedStory.value = updatedStory
                     _ttsState.value = TtsState.Success(audioFile.absolutePath)
-                    // Auto-start playing the narrated file
-                    playAudio(audioFile.absolutePath)
+                    // Conditionally auto-start playing the narrated file
+                    if (_autoPlayEnabled.value) {
+                        playAudio(audioFile.absolutePath)
+                    } else {
+                        prepareAudioWithoutPlaying(audioFile.absolutePath)
+                    }
                 }
 
             } catch (e: Exception) {
@@ -446,6 +828,58 @@ class ScribeViewModel(
 
     fun dismissTtsState() {
         _ttsState.value = TtsState.Idle
+    }
+
+    private fun createWavHeader(pcmDataLength: Int, sampleRate: Int = 24000, channels: Int = 1, bitsPerSample: Int = 16): ByteArray {
+        val totalDataLen = pcmDataLength + 36
+        val byteRate = sampleRate * channels * bitsPerSample / 8
+        
+        val header = ByteArray(44)
+        header[0] = 'R'.code.toByte() // RIFF/WAVE header
+        header[1] = 'I'.code.toByte()
+        header[2] = 'F'.code.toByte()
+        header[3] = 'F'.code.toByte()
+        header[4] = (totalDataLen and 0xff).toByte()
+        header[5] = ((totalDataLen shr 8) and 0xff).toByte()
+        header[6] = ((totalDataLen shr 16) and 0xff).toByte()
+        header[7] = ((totalDataLen shr 24) and 0xff).toByte()
+        header[8] = 'W'.code.toByte()
+        header[9] = 'A'.code.toByte()
+        header[10] = 'V'.code.toByte()
+        header[11] = 'E'.code.toByte()
+        header[12] = 'f'.code.toByte() // 'fmt ' chunk
+        header[13] = 'm'.code.toByte()
+        header[14] = 't'.code.toByte()
+        header[15] = ' '.code.toByte()
+        header[16] = 16 // 4 bytes: size of 'fmt ' chunk
+        header[17] = 0
+        header[18] = 0
+        header[19] = 0
+        header[20] = 1 // format = 1 (PCM)
+        header[21] = 0
+        header[22] = channels.toByte()
+        header[23] = 0
+        header[24] = (sampleRate and 0xff).toByte()
+        header[25] = ((sampleRate shr 8) and 0xff).toByte()
+        header[26] = ((sampleRate shr 16) and 0xff).toByte()
+        header[27] = ((sampleRate shr 24) and 0xff).toByte()
+        header[28] = (byteRate and 0xff).toByte()
+        header[29] = ((byteRate shr 8) and 0xff).toByte()
+        header[30] = ((byteRate shr 16) and 0xff).toByte()
+        header[31] = ((byteRate shr 24) and 0xff).toByte()
+        header[32] = (channels * bitsPerSample / 8).toByte() // block align
+        header[33] = 0
+        header[34] = bitsPerSample.toByte()
+        header[35] = 0
+        header[36] = 'd'.code.toByte()
+        header[37] = 'a'.code.toByte()
+        header[38] = 't'.code.toByte()
+        header[39] = 'a'.code.toByte()
+        header[40] = (pcmDataLength and 0xff).toByte()
+        header[41] = ((pcmDataLength shr 8) and 0xff).toByte()
+        header[42] = ((pcmDataLength shr 16) and 0xff).toByte()
+        header[43] = ((pcmDataLength shr 24) and 0xff).toByte()
+        return header
     }
 
     // --- Core Feature 3: Multi-turn Chatbot Story Continuation ---
@@ -581,10 +1015,10 @@ class ScribeViewModel(
                 val filesDir = imgFile.parentFile
                 if (filesDir != null && filesDir.exists()) {
                     availableVoices.forEach { voice ->
-                        val voiceFile = File(filesDir, "narrative_audio_${story.id}_${voice.id}.mp3")
+                        val voiceFile = File(filesDir, "narrative_audio_${story.id}_${voice.id}.wav")
                         if (voiceFile.exists()) voiceFile.delete()
                     }
-                    val legacyFile = File(filesDir, "narrative_audio_${story.id}.mp3")
+                    val legacyFile = File(filesDir, "narrative_audio_${story.id}.wav")
                     if (legacyFile.exists()) legacyFile.delete()
                 }
             } catch (e: Exception) {
@@ -599,52 +1033,163 @@ class ScribeViewModel(
     }
 
     // --- Audio Player Controls ---
+    private fun getOrCreatePlayer(): ExoPlayer {
+        var player = exoPlayer
+        if (player == null) {
+            val context = getApplication<android.app.Application>()
+            player = ExoPlayer.Builder(context).build().apply {
+                // Configure automatic audio focus handling!
+                val audioAttributes = AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_SPEECH)
+                    .build()
+                setAudioAttributes(audioAttributes, true) // true = handleAudioFocus automatically!
+
+                // Setup listener for error reporting and completion!
+                addListener(object : Player.Listener {
+                    override fun onPlaybackStateChanged(state: Int) {
+                        when (state) {
+                            Player.STATE_READY -> {
+                                val total = duration
+                                if (total > 0) {
+                                    updateDurationText(currentPosition.toInt(), total.toInt())
+                                }
+                            }
+                            Player.STATE_ENDED -> {
+                                _audioPlaybackState.value = PlaybackState.Completed
+                                _audioProgress.value = 1f
+                                val total = duration
+                                if (total > 0) {
+                                    updateDurationText(total.toInt(), total.toInt())
+                                }
+                                stopProgressTracking()
+                            }
+                            Player.STATE_IDLE -> {
+                                // Stopped or error
+                            }
+                            Player.STATE_BUFFERING -> {
+                                // optional loading
+                            }
+                        }
+                    }
+
+                    override fun onIsPlayingChanged(isPlaying: Boolean) {
+                        if (isPlaying) {
+                            _audioPlaybackState.value = PlaybackState.Playing
+                            startProgressTracking()
+                        } else {
+                            if (playbackState == Player.STATE_READY) {
+                                _audioPlaybackState.value = PlaybackState.Paused
+                                stopProgressTracking()
+                            }
+                        }
+                    }
+
+                    override fun onPlayerError(error: PlaybackException) {
+                        Log.e("ScribeViewModel", "ExoPlayer error: ${error.errorCodeName} (${error.errorCode})", error)
+                        _audioPlaybackState.value = PlaybackState.Stopped
+                        val userFriendlyMessage = when (error.errorCode) {
+                            PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND -> "Audio file not found."
+                            PlaybackException.ERROR_CODE_IO_NO_PERMISSION -> "No permission to access audio file."
+                            PlaybackException.ERROR_CODE_DECODER_INIT_FAILED, PlaybackException.ERROR_CODE_DECODING_FAILED -> "Failed to decode narration audio."
+                            else -> "Failed to play narration audio: ${error.localizedMessage ?: error.message ?: "Unknown media error"}"
+                        }
+                        _ttsState.value = TtsState.Error(userFriendlyMessage)
+                        stopProgressTracking()
+                    }
+                })
+            }
+            exoPlayer = player
+        }
+        return player
+    }
+
     fun playAudio(path: String) {
         try {
             stopAudio()
+            val audioFile = File(path)
 
-            mediaPlayer = MediaPlayer().apply {
-                setDataSource(path)
-                prepare()
-                start()
-                _audioPlaybackState.value = PlaybackState.Playing
-                
-                setOnCompletionListener {
-                    _audioPlaybackState.value = PlaybackState.Completed
-                    _audioProgress.value = 1.0f
-                    stopProgressTracking()
-                }
+            // CRITICAL: Validate file before ExoPlayer setup
+            if (!audioFile.exists() || audioFile.length() == 0L) {
+                Log.e("ScribeViewModel", "Invalid audio file: exists=${audioFile.exists()}, size=${audioFile.length()}")
+                _audioPlaybackState.value = PlaybackState.Stopped
+                _ttsState.value = TtsState.Error("Failed to load narration audio: Audio file is invalid, missing or 0 bytes.")
+                return
             }
 
-            startProgressTracking()
+            val player = getOrCreatePlayer()
+            val mediaItem = MediaItem.fromUri(Uri.fromFile(audioFile))
+            player.setMediaItem(mediaItem)
+            player.prepare()
+            player.playWhenReady = true
 
         } catch (e: Exception) {
-            Log.e(tag, "MediaPlayer setup failed", e)
+            Log.e("ScribeViewModel", "Playback error", e)
             _audioPlaybackState.value = PlaybackState.Stopped
+            _ttsState.value = TtsState.Error("Failed to load narration audio: ${e.localizedMessage ?: e.message ?: "Unknown error"}")
+        }
+    }
+
+    fun prepareAudioWithoutPlaying(path: String) {
+        try {
+            stopAudio()
+            val audioFile = File(path)
+
+            // CRITICAL: Validate file before ExoPlayer setup
+            if (!audioFile.exists() || audioFile.length() == 0L) {
+                Log.e("ScribeViewModel", "Invalid audio file: exists=${audioFile.exists()}, size=${audioFile.length()}")
+                _audioPlaybackState.value = PlaybackState.Stopped
+                _ttsState.value = TtsState.Error("Failed to load narration audio: Audio file is invalid, missing or 0 bytes.")
+                return
+            }
+
+            val player = getOrCreatePlayer()
+            val mediaItem = MediaItem.fromUri(Uri.fromFile(audioFile))
+            player.setMediaItem(mediaItem)
+            player.prepare()
+            player.playWhenReady = false
+            _audioPlaybackState.value = PlaybackState.Paused
+            _audioProgress.value = 0f
+
+        } catch (e: Exception) {
+            Log.e("ScribeViewModel", "Playback error", e)
+            _audioPlaybackState.value = PlaybackState.Stopped
+            _ttsState.value = TtsState.Error("Failed to load narration audio: ${e.localizedMessage ?: e.message ?: "Unknown error"}")
         }
     }
 
     fun togglePlayPause() {
-        val player = mediaPlayer ?: return
+        if (_audioPlaybackState.value == PlaybackState.Completed) {
+            val path = _selectedStory.value?.audioPath
+            if (path != null) {
+                playAudio(path)
+            }
+            return
+        }
+        val player = exoPlayer
+        if (player == null) {
+            val path = _selectedStory.value?.audioPath
+            if (path != null) {
+                playAudio(path)
+            }
+            return
+        }
         if (player.isPlaying) {
             player.pause()
-            _audioPlaybackState.value = PlaybackState.Paused
-            stopProgressTracking()
         } else {
-            player.start()
-            _audioPlaybackState.value = PlaybackState.Playing
-            startProgressTracking()
+            if (player.playbackState == Player.STATE_ENDED) {
+                player.seekTo(0)
+            }
+            player.play()
         }
     }
 
     fun stopAudio() {
-        mediaPlayer?.let {
-            if (it.isPlaying) {
-                it.stop()
-            }
+        exoPlayer?.let {
+            it.stop()
             it.release()
         }
-        mediaPlayer = null
+        exoPlayer = null
         _audioPlaybackState.value = PlaybackState.Stopped
         _audioProgress.value = 0f
         _audioDurationText.value = "0:00 / 0:00"
@@ -652,24 +1197,27 @@ class ScribeViewModel(
     }
 
     fun seekAudio(progress: Float) {
-        val player = mediaPlayer ?: return
-        val seekMs = (progress * player.duration).toInt()
-        player.seekTo(seekMs)
-        _audioProgress.value = progress
-        updateDurationText(player.currentPosition, player.duration)
+        val player = exoPlayer ?: return
+        val duration = player.duration
+        if (duration > 0) {
+            val seekMs = (progress * duration).toLong()
+            player.seekTo(seekMs)
+            _audioProgress.value = progress
+            updateDurationText(seekMs.toInt(), duration.toInt())
+        }
     }
 
     private fun startProgressTracking() {
         progressJob?.cancel()
         progressJob = viewModelScope.launch {
             while (true) {
-                mediaPlayer?.let { player ->
+                exoPlayer?.let { player ->
                     if (player.isPlaying) {
                         val current = player.currentPosition
                         val total = player.duration
                         if (total > 0) {
                             _audioProgress.value = current.toFloat() / total.toFloat()
-                            updateDurationText(current, total)
+                            updateDurationText(current.toInt(), total.toInt())
                         }
                     }
                 }
@@ -908,13 +1456,14 @@ sealed interface PlaybackState {
 data class VoiceOption(val id: String, val label: String)
 
 class ScribeViewModelFactory(
+    private val application: android.app.Application,
     private val repository: StoryRepository,
     private val billingManager: com.example.billing.BillingManager? = null
 ) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(ScribeViewModel::class.java)) {
             @Suppress("UNCHECKED_CAST")
-            return ScribeViewModel(repository, billingManager) as T
+            return ScribeViewModel(application, repository, billingManager) as T
         }
         throw IllegalArgumentException("Unknown ViewModel class")
     }

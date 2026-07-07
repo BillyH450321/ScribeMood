@@ -13,6 +13,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.LinearEasing
@@ -55,6 +57,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Book
 import androidx.compose.material.icons.filled.Close
@@ -93,6 +96,8 @@ import androidx.compose.material3.SuggestionChip
 import androidx.compose.material3.SuggestionChipDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -123,6 +128,7 @@ import com.example.data.ChatMessageEntity
 import com.example.data.StoryEntity
 import com.example.data.StoryRepository
 import com.example.ui.theme.MyApplicationTheme
+import com.example.ui.AuthFlowContainer
 import com.example.viewmodel.GenerationState
 import com.example.viewmodel.PlaybackState
 import com.example.viewmodel.ScribeViewModel
@@ -144,9 +150,12 @@ class MainActivity : ComponentActivity() {
         billingManager = BillingManager(this, lifecycleScope)
 
         val database = AppDatabase.getDatabase(applicationContext)
-        val repository = StoryRepository(database.storyDao())
-        val viewModelFactory = ScribeViewModelFactory(repository, billingManager)
+        val repository = StoryRepository(database.storyDao(), database.userSessionDao())
+        val viewModelFactory = ScribeViewModelFactory(application, repository, billingManager)
         val viewModel = ViewModelProvider(this, viewModelFactory)[ScribeViewModel::class.java]
+        
+        // Load the persistent user preferences
+        viewModel.loadAutoPlayPreference(this)
 
         setContent {
             MyApplicationTheme {
@@ -165,6 +174,9 @@ fun ScribeAppScreen(viewModel: ScribeViewModel, billingManager: BillingManager) 
     val generationState by viewModel.generationState.collectAsState()
     val apiRetryStatus by viewModel.apiRetryStatus.collectAsState()
 
+    var showProfileSettings by remember { mutableStateOf(false) }
+    var showPaywall by remember { mutableStateOf(false) }
+
     LaunchedEffect(generationState) {
         if (generationState is GenerationState.Success) {
             currentTab = Tab.Active
@@ -172,91 +184,129 @@ fun ScribeAppScreen(viewModel: ScribeViewModel, billingManager: BillingManager) 
         }
     }
 
-    Scaffold(
-        modifier = Modifier.fillMaxSize(),
-        bottomBar = {
-            NavigationBar(
-                modifier = Modifier.testTag("bottom_nav_bar"),
-                containerColor = MaterialTheme.colorScheme.surfaceContainer,
-                tonalElevation = 8.dp
-            ) {
-                NavigationBarItem(
-                    selected = currentTab == Tab.Draft,
-                    onClick = { currentTab = Tab.Draft },
-                    icon = { Icon(Icons.Filled.Add, contentDescription = "Draft Space") },
-                    label = { Text("Draft Space") },
-                    modifier = Modifier.testTag("nav_draft")
-                )
-                NavigationBarItem(
-                    selected = currentTab == Tab.Active,
-                    onClick = { currentTab = Tab.Active },
-                    icon = { Icon(Icons.Filled.Book, contentDescription = "Narrator") },
-                    label = { Text("Narrator") },
-                    modifier = Modifier.testTag("nav_narrator")
-                )
-                NavigationBarItem(
-                    selected = currentTab == Tab.Library,
-                    onClick = { currentTab = Tab.Library },
-                    icon = { Icon(Icons.Filled.History, contentDescription = "Library") },
-                    label = { Text("Library (${allStories.size})") },
-                    modifier = Modifier.testTag("nav_library")
-                )
-            }
-        }
-    ) { innerPadding ->
+    AuthFlowContainer(viewModel = viewModel) {
         Box(modifier = Modifier.fillMaxSize()) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding)
-                    .background(
-                        Brush.verticalGradient(
-                            colors = listOf(
-                                MaterialTheme.colorScheme.surface,
-                                MaterialTheme.colorScheme.surfaceDim
+            Scaffold(
+                modifier = Modifier.fillMaxSize(),
+                bottomBar = {
+                    NavigationBar(
+                        modifier = Modifier.testTag("bottom_nav_bar"),
+                        containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                        tonalElevation = 8.dp
+                    ) {
+                        NavigationBarItem(
+                            selected = currentTab == Tab.Draft,
+                            onClick = { currentTab = Tab.Draft },
+                            icon = { Icon(Icons.Filled.Add, contentDescription = "Mood Space") },
+                            label = { Text("Mood Space") },
+                            modifier = Modifier.testTag("nav_draft")
+                        )
+                        NavigationBarItem(
+                            selected = currentTab == Tab.Active,
+                            onClick = { currentTab = Tab.Active },
+                            icon = { Icon(Icons.Filled.Book, contentDescription = "Narrator") },
+                            label = { Text("Narrator") },
+                            modifier = Modifier.testTag("nav_narrator")
+                        )
+                        NavigationBarItem(
+                            selected = currentTab == Tab.Library,
+                            onClick = { currentTab = Tab.Library },
+                            icon = { Icon(Icons.Filled.History, contentDescription = "Library") },
+                            label = { Text("Library (${allStories.size})") },
+                            modifier = Modifier.testTag("nav_library")
+                        )
+                    }
+                }
+            ) { innerPadding ->
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding)
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(
+                                    MaterialTheme.colorScheme.surface,
+                                    MaterialTheme.colorScheme.surfaceDim
+                                )
                             )
                         )
-                    )
-            ) {
-                HeaderSection(billingManager = billingManager)
-
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
                 ) {
-                    when (currentTab) {
-                        Tab.Draft -> DraftSpaceTab(viewModel = viewModel)
-                        Tab.Active -> ActiveStoryTab(viewModel = viewModel, onGoToDraft = { currentTab = Tab.Draft })
-                        Tab.Library -> LibraryTab(viewModel = viewModel, onSelectStory = { currentTab = Tab.Active })
+                    HeaderSection(
+                        viewModel = viewModel,
+                        billingManager = billingManager,
+                        onOpenProfile = { showProfileSettings = true },
+                        onOpenPaywall = { showPaywall = true }
+                    )
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                    ) {
+                        when (currentTab) {
+                            Tab.Draft -> DraftSpaceTab(viewModel = viewModel)
+                            Tab.Active -> ActiveStoryTab(viewModel = viewModel, onGoToDraft = { currentTab = Tab.Draft })
+                            Tab.Library -> LibraryTab(viewModel = viewModel, onSelectStory = { currentTab = Tab.Active })
+                        }
+                    }
+                }
+
+                AnimatedVisibility(
+                    visible = apiRetryStatus != null,
+                    enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
+                    exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = innerPadding.calculateBottomPadding() + 16.dp)
+                ) {
+                    apiRetryStatus?.let { status ->
+                        CustomRetryNotification(status = status)
                     }
                 }
             }
 
+            // Slide-in Profile screen overlay
             AnimatedVisibility(
-                visible = apiRetryStatus != null,
+                visible = showProfileSettings,
+                enter = slideInHorizontally(initialOffsetX = { it }) + fadeIn(),
+                exit = slideOutHorizontally(targetOffsetX = { it }) + fadeOut(),
+                modifier = Modifier.fillMaxSize()
+            ) {
+                com.example.ui.AccountSettingsScreen(
+                    viewModel = viewModel,
+                    onBack = { showProfileSettings = false }
+                )
+            }
+
+            // Slide-up Paywall screen overlay
+            AnimatedVisibility(
+                visible = showPaywall,
                 enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
                 exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = innerPadding.calculateBottomPadding() + 16.dp)
+                modifier = Modifier.fillMaxSize()
             ) {
-                apiRetryStatus?.let { status ->
-                    CustomRetryNotification(status = status)
-                }
+                com.example.ui.PaywallScreen(
+                    viewModel = viewModel,
+                    onDismiss = { showPaywall = false }
+                )
             }
         }
     }
 }
 
 @Composable
-fun HeaderSection(billingManager: com.example.billing.BillingManager) {
+fun HeaderSection(
+    viewModel: ScribeViewModel,
+    billingManager: com.example.billing.BillingManager,
+    onOpenProfile: () -> Unit,
+    onOpenPaywall: () -> Unit
+) {
     val isApiKeyConfigured = remember {
         val key = BuildConfig.GEMINI_API_KEY
         key.isNotEmpty() && key != "MY_GEMINI_API_KEY"
     }
     
-    val isProUser by billingManager.isProUser.collectAsState()
+    val isPremiumActive by viewModel.isPremium.collectAsState()
     val proProductDetails by billingManager.proProductDetails.collectAsState()
     val activity = LocalContext.current as? Activity
 
@@ -296,43 +346,55 @@ fun HeaderSection(billingManager: com.example.billing.BillingManager) {
                     )
                 }
 
-                Surface(
-                    shape = CircleShape,
-                    color = if (isProUser) Color(0xFFF3E5F5) else (if (isApiKeyConfigured) Color(0xFFE8F5E9) else Color(0xFFFFEBEE)),
-                    border = BorderStroke(1.dp, if (isProUser) Color(0xFFBA68C8) else (if (isApiKeyConfigured) Color(0xFF81C784) else Color(0xFFE57373)))
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Surface(
+                        shape = CircleShape,
+                        color = if (isPremiumActive) Color(0xFFF3E5F5) else (if (isApiKeyConfigured) Color(0xFFE8F5E9) else Color(0xFFFFEBEE)),
+                        border = BorderStroke(1.dp, if (isPremiumActive) Color(0xFFBA68C8) else (if (isApiKeyConfigured) Color(0xFF81C784) else Color(0xFFE57373)))
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .clip(CircleShape)
-                                .background(if (isProUser) Color(0xFF9C27B0) else (if (isApiKeyConfigured) Color(0xFF4CAF50) else Color(0xFFF44336)))
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = if (isProUser) "PRO TIER" else (if (isApiKeyConfigured) "Gemini Active" else "Setup Required"),
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = if (isProUser) Color(0xFF6A1B9A) else (if (isApiKeyConfigured) Color(0xFF2E7D32) else Color(0xFFC62828))
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(if (isPremiumActive) Color(0xFF9C27B0) else (if (isApiKeyConfigured) Color(0xFF4CAF50) else Color(0xFFF44336)))
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (isPremiumActive) "PREMIUM" else (if (isApiKeyConfigured) "Gemini Active" else "Setup Required"),
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isPremiumActive) Color(0xFF6A1B9A) else (if (isApiKeyConfigured) Color(0xFF2E7D32) else Color(0xFFC62828))
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.width(8.dp))
+
+                    IconButton(
+                        onClick = onOpenProfile,
+                        modifier = Modifier.testTag("settings_button").size(36.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.AccountCircle,
+                            contentDescription = "Profile Settings",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(28.dp)
                         )
                     }
                 }
             }
 
-            AnimatedVisibility(visible = !isProUser && proProductDetails != null) {
-                val price = proProductDetails?.oneTimePurchaseOfferDetails?.formattedPrice ?: "$4.99"
+            AnimatedVisibility(visible = !isPremiumActive && proProductDetails != null) {
+                val price = proProductDetails?.oneTimePurchaseOfferDetails?.formattedPrice ?: "$9.99"
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(top = 16.dp)
-                        .clickable {
-                            if (activity != null) {
-                                billingManager.launchBillingFlow(activity)
-                            }
-                        }
+                        .clickable { onOpenPaywall() }
                         .testTag("upgrade_to_pro_card"),
                     colors = CardDefaults.cardColors(
                         containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.7f)
@@ -365,7 +427,7 @@ fun HeaderSection(billingManager: com.example.billing.BillingManager) {
                             }
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = "High-fidelity details & extended context narrative generation.",
+                                text = "High-fidelity details, extended context, and elite voiceovers.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.8f)
                             )
@@ -439,7 +501,7 @@ fun DraftSpaceTab(viewModel: ScribeViewModel) {
 
     val presetCues = listOf(
         "Sci-Fi Cyberpunk", "Dark Gothic Fantasy", "Regency Romance",
-        "Cosmic Horror", "Post-Apocalyptic Solitude", "Whimsical Fairy Tale"
+        "Cosmic Horror", "Post-Apocalyptic Solitude", "Fictional Dream"
     )
 
     LazyColumn(
@@ -855,7 +917,18 @@ fun ActiveStoryTab(viewModel: ScribeViewModel, onGoToDraft: () -> Unit) {
                 onTogglePlay = { viewModel.togglePlayPause() },
                 onStop = { viewModel.stopAudio() },
                 onSeek = { viewModel.seekAudio(it) },
-                onDismissError = { viewModel.dismissTtsState() }
+                onDismissError = { viewModel.dismissTtsState() },
+                onRetry = {
+                    val errorMsg = (ttsState as? TtsState.Error)?.error ?: ""
+                    if (errorMsg.contains("Failed to load narration audio")) {
+                        val path = story!!.audioPath
+                        if (path != null) {
+                            viewModel.playAudio(path)
+                        }
+                    } else {
+                        viewModel.generateTts(context, story!!)
+                    }
+                }
             )
         }
 
@@ -1106,7 +1179,8 @@ fun NarratorControlHub(
     onTogglePlay: () -> Unit,
     onStop: () -> Unit,
     onSeek: (Float) -> Unit,
-    onDismissError: () -> Unit
+    onDismissError: () -> Unit,
+    onRetry: () -> Unit
 ) {
     var voiceExpanded by remember { mutableStateOf(false) }
 
@@ -1328,36 +1402,68 @@ fun NarratorControlHub(
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 12.dp),
+                        .padding(top = 12.dp)
+                        .testTag("narration_error_card"),
                     colors = CardDefaults.cardColors(
                         containerColor = MaterialTheme.colorScheme.errorContainer
                     )
                 ) {
-                    Row(
-                        modifier = Modifier.padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
+                    Column(
+                        modifier = Modifier.padding(12.dp)
                     ) {
-                        Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.Top
+                        ) {
                             Icon(
                                 imageVector = Icons.Filled.Warning,
                                 contentDescription = "Error",
-                                tint = MaterialTheme.colorScheme.error
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(top = 2.dp)
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
                                 text = errorMsg,
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onErrorContainer
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.weight(1f)
                             )
                         }
-                        IconButton(onClick = onDismissError) {
-                            Icon(
-                                imageVector = Icons.Filled.Close,
-                                contentDescription = "Dismiss",
-                                tint = MaterialTheme.colorScheme.onErrorContainer,
-                                modifier = Modifier.size(16.dp)
-                            )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextButton(
+                                onClick = onDismissError,
+                                colors = ButtonDefaults.textButtonColors(
+                                    contentColor = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.7f)
+                                )
+                            ) {
+                                Text("Dismiss", style = MaterialTheme.typography.labelMedium)
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Button(
+                                onClick = onRetry,
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.error,
+                                    contentColor = MaterialTheme.colorScheme.onError
+                                ),
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                modifier = Modifier
+                                    .height(32.dp)
+                                    .testTag("narration_retry_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Refresh,
+                                    contentDescription = "Retry",
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Retry", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                            }
                         }
                     }
                 }

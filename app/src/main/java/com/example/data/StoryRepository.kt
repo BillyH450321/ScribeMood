@@ -2,8 +2,27 @@ package com.example.data
 
 import kotlinx.coroutines.flow.Flow
 
-class StoryRepository(private val storyDao: StoryDao) {
+class StoryRepository(
+    private val storyDao: StoryDao,
+    private val userSessionDao: UserSessionDao
+) {
     val allStories: Flow<List<StoryEntity>> = storyDao.getAllStories()
+
+    fun getUserSessionFlow(): Flow<UserSessionEntity?> = userSessionDao.getUserSessionFlow()
+
+    suspend fun getUserSession(): UserSessionEntity? = userSessionDao.getUserSession()
+
+    suspend fun insertUserSession(session: UserSessionEntity) {
+        userSessionDao.insertUserSession(session)
+    }
+
+    suspend fun updateUserSession(session: UserSessionEntity) {
+        userSessionDao.updateUserSession(session)
+    }
+
+    suspend fun deleteUserSession() {
+        userSessionDao.deleteUserSession()
+    }
 
     suspend fun getStoryById(id: Int): StoryEntity? {
         return storyDao.getStoryById(id)
